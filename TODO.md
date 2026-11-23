@@ -1,45 +1,31 @@
-# TODO List
+# Fork milestones
 
-## Ongoing
+This roadmap tracks the compfaculty fork, which starts from upstream 0.14.1. The [changelog](CHANGELOG.md) records changes available in the checkout.
 
-- [ ] Better documentation (incl. rpxy.io)
-- [ ] Add more tests
+## 1. Establish the fork baseline
 
-## Planned / pending features
+- [x] Document the build, workspace, and request flow in the [README](README.md).
+- [x] Cover startup errors, rejected reloads, accepted reloads, and listener bind failures with process-level regression tests.
+- [ ] Confirm the Linux CI matrix passes for the default Quinn build, a TCP-only build, and the s2n-quic build.
+- [x] Verify multi-domain TLS, distinct upstreams, and client authentication across the three local builds. The [acceptance test](rpxy-bin/tests/lifecycle/tls.rs) covers HTTP/1.1 and HTTP/2 in every build and HTTP/3 in both QUIC builds.
+- [ ] Record a repeatable performance baseline using the [benchmark harness](bench/README.md). Measure throughput, tail latency, CPU, and memory across HTTP/1.1, HTTP/2, and HTTP/3. Include TLS handshakes and steady-state connection reuse.
 
-### Cache
+## 2. Make configuration changes safer to deploy
 
-- Persistent cache (if practical)
-- Reconsider the on-memory store data structure (currently `lru` crate)
+- [x] Add a `--check-config` command for CI and deployment scripts. It validates routes, static TLS materials, and feature settings without binding listeners or contacting ACME.
+- [ ] Add rollback for reload failures discovered during listener startup. Cover occupied TCP and UDP ports, invalid certificates, and rapid successive edits.
+- [ ] Define how existing connections drain on reload and shutdown. Verify connection reuse, long-lived streams, and the transition between connection limits in successive generations.
+- [ ] Finish HTTP/3 stream error handling for late request length mismatches. Add coverage with an early-responding local upstream.
 
-### Routing
+## 3. Add operations features
 
-- Improvement of the path matcher
-  - Currently `HashMap<PathName, _>` + `max_by_key`; consider trie / radix tree
-- More flexible options for rewriting the request path
+- [ ] Expose opt-in metrics for request latency and status, active connections, upstream health, and reload outcomes. Bound label cardinality to configured apps and routes, and avoid labeling with client-supplied hostnames or paths. Evaluate OpenTelemetry export once the metrics are stable.
+- [ ] Make sticky-cookie name and lifetime configurable per route. Preserve existing deployments with compatible defaults.
+- [ ] Evaluate serving complete client certificate chains and supporting per-domain client authentication over HTTP/3. Keep client-authentication domains off HTTP/3 until the QUIC path can enforce the same policy as TCP.
 
-### Load balancing (`sticky-cookie` feature)
+## Backlog
 
-- Make the sticky cookie name configurable (currently hard-coded)
-- Make the sticky cookie duration configurable (currently 300 s constant)
-
-### TLS / client certificates
-
-- Support intermediate certificates (currently only client certificates directly signed by the root CA are supported)
-- Lift the HTTP/3 + client-authentication limitation
-  - HTTP/2 and HTTP/1.1 use a per-domain `rustls::ServerConfig`, so client-auth can be configured per domain.
-  - HTTP/3 currently uses an aggregated `rustls::ServerConfig` for all non-client-auth domains, so a domain configured with client authentication cannot be served over HTTP/3.
-
-### HTTP/3
-
-- Reset the response with `H3_MESSAGE_ERROR` when a request body / Content-Length mismatch is detected after the upstream response has started (RFC 9114 §4.1.2)
-  - Currently the mismatch flag is checked only once, before `send_response`; a later mismatch only stops the receiving side, so the response can still complete. No upstream desync (excess DATA is never forwarded).
-  - Idea: signal the mismatch via `tokio::sync::oneshot` and `tokio::select!` over the handler and response streaming, then `stop_stream` the send side. Needs an E2E test with an early-responding upstream.
-
-### Observability
-
-- Traces and metrics via OpenTelemetry (`tracing-opentelemetry` crate)
-
-### Misc
-
-- Options to serve a custom HTTP error page
+- More flexible path rewrites and custom HTTP error pages.
+- A radix or trie matcher if profiling shows that the current longest-prefix scan dominates at realistic route counts.
+- Persistent caching and changes to the in-memory LRU if measured workloads justify the operational cost.
+- Expand configuration reference and tests as fork features are added.

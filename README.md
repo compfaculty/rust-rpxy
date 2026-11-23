@@ -1,12 +1,11 @@
 # rpxy: A simple and ultrafast reverse-proxy serving multiple domain names with TLS termination, written in Rust
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Unit Test](https://github.com/junkurihara/rust-rpxy/actions/workflows/ci.yml/badge.svg)
-![Docker](https://github.com/junkurihara/rust-rpxy/actions/workflows/release_docker.yml/badge.svg)
-![ShiftLeft Scan](https://github.com/junkurihara/rust-rpxy/actions/workflows/shift_left.yml/badge.svg)
-[![Docker Image Size (latest by date)](https://img.shields.io/docker/image-size/jqtype/rpxy)](https://hub.docker.com/r/jqtype/rpxy)
+[![Fork Linux tests](https://github.com/compfaculty/rust-rpxy/actions/workflows/ci.yml/badge.svg)](https://github.com/compfaculty/rust-rpxy/actions/workflows/ci.yml)
 
 > **Work-in-progress project that is being evolved.**
+
+This is the `compfaculty` fork of rust-rpxy. See the [fork milestones](TODO.md) for release criteria and feature proposals, and the [changelog](CHANGELOG.md) for changes since the inherited release.
 
 > [!NOTE]
 > This project is an HTTP (i.e., Layer 7) reverse-proxy. If you are looking for a TCP/UDP (i.e., Layer 4) reverse-proxy, please check my other project [`rpxy-l4`](https://github.com/junkurihara/rust-rpxy-l4).
@@ -43,25 +42,31 @@ The supported features are summarized as follows:
 
 This project is still *work-in-progress*. However, it is already working in some production environments and serves a number of domain names. The [`bench`](./bench/) directory provides a reverse-proxy benchmarking harness you can run on your own target; note that reverse-proxy performance is highly dependent on hardware, configuration, and environment, so we make no performance-ranking claim here (see the caveat in [`bench/README.md`](./bench/README.md)).
 
+### Request flow and workspace
+
+1. The binary loads TOML, builds the application and listener settings, and starts a service generation. The certificate reloader can update TLS material while the listeners run. [`rpxy-bin`](rpxy-bin/) · [`rpxy-certs`](rpxy-certs/) · [`rpxy-acme`](rpxy-acme/)
+2. TCP listeners serve HTTP/1.1 and HTTP/2. TLS selects a certificate by SNI and enforces client authentication for domains that require it. When enabled, inbound PROXY protocol is parsed on TCP before any TLS handshake. HTTP/3 uses a separate QUIC listener on UDP. [Listener code](rpxy-lib/src/proxy/)
+3. The message handler validates the request authority against SNI where required and selects an app by hostname. It matches the longest configured path prefix on a path boundary, then selects an upstream according to the route's balancing and health-check policy. [Message handler](rpxy-lib/src/message_handler/) · [Backend routing](rpxy-lib/src/backend/)
+4. The proxy applies the route's rewrite and header policies, then streams the request to the upstream and the response to the client. The forwarder can cache eligible responses when enabled. [Forwarder](rpxy-lib/src/forwarder/)
+
+HTTP forwarding headers and inbound PROXY protocol each have a corresponding trust setting. CDN aliases for trusted IP ranges come from the snapshots in [`rpxy-trusted-proxies`](rpxy-trusted-proxies/).
+
 ## Installing/Building an Executable Binary of `rpxy`
 
 ### Building from Source
 
-You can build an executable binary yourself by checking out this Git repository.
+The workspace requires Rust 1.100 or later. Initialize the pinned submodules before building from the fork.
 
 ```bash
-# Cloning the git repository
-% git clone https://github.com/junkurihara/rust-rpxy
-% cd rust-rpxy
+git clone --recurse-submodules https://github.com/compfaculty/rust-rpxy.git
+cd rust-rpxy
+cargo build --release --locked -p rpxy
+```
 
-# Update submodules
-% git submodule update --init
+The default binary includes Quinn for HTTP/3 and rustls for HTTPS upstreams. Runtime HTTP/3 requires `[experimental.h3]` and a TLS listener. To build with s2n-quic and retain HTTPS upstream support, explicitly select both features.
 
-# Build (default: QUIC and HTTP/3 is enabled using `quinn`)
-% cargo build --release
-
-# If you want to use `s2n-quic`, build as follows. You may need several additional dependencies.
-% cargo build --no-default-features --features http3-s2n --release
+```bash
+cargo build --release --locked -p rpxy --no-default-features --features http3-s2n,rustls-backend
 ```
 
 Then you have an executable binary `rust-rpxy/target/release/rpxy`.
@@ -81,7 +86,7 @@ You can find the Jenkins CI/CD build scripts for `rpxy` in the [./.build](./.bui
 
 Prebuilt packages for Linux RPM and DEB are available at [https://rpxy.gamerboy59.dev](https://rpxy.gamerboy59.dev), provided by [@Gamerboy59](https://github.com/Gamerboy59).
 
-**Warning**: These packages are built and distributed by a third party, and they may lag behind the latest release of `rpxy`, sometimes by several versions. Since new releases often include security-related fixes and improvements, please check the packaged version before installation. To always run the latest release, use the prebuilt binaries on the [GitHub Releases page](https://github.com/junkurihara/rust-rpxy/releases) or the docker image (see below).
+These third-party packages track upstream releases and may lag behind them. Check the package version before installing. See [upstream GitHub releases](https://github.com/junkurihara/rust-rpxy/releases) for upstream binaries.
 
 </details>
 
@@ -95,19 +100,34 @@ You can run `rpxy` with a configuration file like
 % ./target/release/rpxy --config config.toml
 ```
 
-`rpxy` tracks changes to `config.toml` in real-time and applies changes immediately without restarting the process. Note that if `config.toml` is removed, renamed or moved (including moving to trash), `rpxy` continues running with the last valid configuration until a new file named `config.toml` is created in the same directory.
+At startup, `rpxy` exits with an error if it cannot read or parse the configuration. During operation, it checks for updates on filesystem events and rereads the file every 15 seconds to catch missed events. A missing file, invalid TOML, or a configuration rejected while preparing the replacement leaves the current service running. Restore or correct the file at the watched path to try again.
+
+An accepted configuration change stops the previous listeners and starts replacements in the same process. New connections can see a brief interruption during rebinding. If a replacement listener fails to bind, the process exits with an error. Established TCP connections may continue using the configuration under which they were accepted.
 
 The full help message is as follows.
 
-```bash:
-usage: rpxy [OPTIONS] --config <FILE>
+```text
+Usage: rpxy [OPTIONS] --config <FILE>
 
 Options:
   -c, --config <FILE>      Configuration file path like ./config.toml
   -l, --log-dir <LOG_DIR>  Directory for log files. If not specified, logs are printed to stdout.
+      --check-config      Validate configuration and local TLS files, then exit.
   -h, --help               Print help
   -V, --version            Print version
 ```
+
+### Check a configuration before deploying
+
+```bash
+./target/release/rpxy --config config.toml --check-config
+```
+
+Run the check with the same binary, working directory, and file permissions as the deployment. It exits with status 0 on success and 1 on validation errors. It reports unknown or misplaced fields, settings that require missing build features, duplicate routes, and invalid static TLS material. For static TLS, the check reads the files, checks the server name and certificate validity dates, matches the certificate to the private key, and confirms that a configured client CA file supplies a usable trust anchor.
+
+The check performs local validation. ACME configuration is checked without issuing certificates or creating the registry. Upstream reachability, listener availability, and certificate trust from a remote client's perspective are deployment checks. The command prints diagnostics to the terminal and conflicts with `--log-dir`.
+
+### Logs
 
 If you set `--log-dir=<log_dir>`, the log files are created in the specified directory. Otherwise, the log is printed to stdout.
 
@@ -149,7 +169,7 @@ GET /path/to HTTP/1.1\r\n
 HOST: app1.example.com\r\n
 ```
 
-Otherwise, a request to `other.example.com` is simply rejected with status code `40x`.
+A request to an unconfigured hostname such as `other.example.com` receives `503 Service Unavailable` when `default_app` is unset.
 
 If you want to host multiple distinct domain names on a single IP address/port, simply create multiple `app."<app_name>"` entries in the config file like
 
@@ -184,14 +204,13 @@ When a request falls through to the `default_app`, `rpxy` rewrites the outgoing 
 The request message will be routed to the backend application specified with the domain name `app1.localdomain:8080` or IP address over cleartext HTTP. If the backend channel needs to serve TLS, like forwarding to `https://app1.localdomain:8080`, you need to enable the `tls` option for the location.
 
 ```toml
-reverse_proxy = [
-  { location = 'app1.localdomain:8080', tls = true }
-]
+[[apps.app1.reverse_proxy]]
+upstream = [{ location = 'app1.localdomain:8080', tls = true }]
 ```
 
 #### Load Balancing
 
-You can specify multiple backend locations in the `reverse_proxy` array for *load-balancing* with an appropriate `load_balance` option. Currently it works in a round-robin manner, randomly, or round-robin with *session-persistence* using cookies. If `load_balance` is not specified, the first backend location is always chosen.
+Set `load_balance` on a route to select `round_robin`, `random`, `sticky` (cookie-based session persistence), or `primary_backup` (requires active health checks). The default, `none`, selects the first upstream, or the first healthy upstream when active health checks are enabled. See [`config-example.toml`](config-example.toml) for TCP and HTTP health-check settings.
 
 ```toml
 # Required only when any reverse_proxy uses load_balance = 'sticky'.
@@ -224,7 +243,7 @@ tls = { tls_cert_path = 'server.crt',  tls_cert_key_path = 'server.key' }
 reverse_proxy = [{ upstream = [{ location = 'app1.local:8080' }] }]
 ```
 
-In the above setting, both cleartext HTTP requests to port 80 and encrypted HTTPS requests to port 443 are routed to the backend `app1.local:8080` in the same manner. If you don't need to serve cleartext requests, just remove `listen_port = 80` and specify only `listen_port_tls = 443`.
+For this app, HTTP requests on port 80 redirect to HTTPS by default. HTTPS requests on port 443 are routed to `app1.local:8080`. For an HTTPS-only listener, remove `listen_port = 80` and leave `https_redirection` unset.
 
 Note that the private key specified by `tls_cert_key_path` must be *in PKCS8 format*. (See TIPS to convert PKCS1 formatted private keys to PKCS8 format.)
 
@@ -255,7 +274,7 @@ listen_port_tls = 443
 
 [apps.app1]
 server_name = 'app1.example.com'
-tls = { https_redirection = true, tls_cert_path = 'server.crt', tls_cert_key_path = 'server.key' }
+tls = { tls_cert_path = 'server.crt', tls_cert_key_path = 'server.key' }
 
 [[apps.app1.reverse_proxy]]
 upstream = [
@@ -280,7 +299,7 @@ In the above example, a request to `https://app1.example.com/path/to?query=ok` m
 
 On the other hand, a request to `https://app1.example.com/path/another/xx?query=ng` matching the third entry is routed with *its path information being rewritten* as specified by the `replace_path` option. Namely, the matched `/path/another` part is rewritten to `/path`, and it is served as `http://another.backend.local/path/xx?query=ng`.
 
-Requests that don't match any paths will be routed by the first entry that doesn't have the `path` option, which serves as the *default destination*. In other words, unless every `reverse_proxy` entry has an explicit `path` option, `rpxy` rejects requests that don't match any paths.
+A route with an omitted `path` matches `/` and serves as the default for the app. When no route matches, `rpxy` returns `404 Not Found`.
 
 #### Simple Path-based Routing
 
@@ -359,7 +378,7 @@ This setting is separate from inbound HAProxy PROXY protocol support. `trusted_f
 
 ## Using Docker Image
 
-You can also use the `docker` image hosted on [Docker Hub](https://hub.docker.com/r/jqtype/rpxy) and [GitHub Container Registry](https://github.com/junkurihara/rust-rpxy/pkgs/container/rust-rpxy) instead of directly executing the binary. See the [`./docker`](./docker/README.md) directory for more details.
+The prebuilt Docker images are upstream artifacts. See the [Docker guide](./docker/README.md) for usage and upstream registry links. Use the fork's source build for changes described in the unreleased changelog.
 
 ## Example
 

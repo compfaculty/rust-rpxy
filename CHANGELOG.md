@@ -2,6 +2,17 @@
 
 ## 0.14.2 or 0.15.0 (Unreleased)
 
+### Features
+
+- Add `--check-config` for offline validation of routes, build-feature settings, and local TLS files before deployment.
+
+### Bugfixes
+
+- Exit with a diagnostic and a nonzero status when the startup configuration is missing, unreadable, or malformed.
+- Keep the running listeners when a configuration update is rejected during preparation. On accepted updates, wait for the previous listener tasks to stop before starting replacements.
+- Recheck the config file periodically so a missed filesystem event cannot leave an update unapplied.
+- Propagate TLS and QUIC listener errors to the service supervisor so a bind failure is visible in the process exit status.
+
 ## 0.14.1
 
 ### Bugfix

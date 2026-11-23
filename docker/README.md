@@ -1,6 +1,6 @@
 # Docker Images of `rpxy`
 
-The `rpxy` docker images are hosted both on [Docker Hub](https://hub.docker.com/r/jqtype/rpxy) and [GitHub Container Registry](https://github.com/junkurihara/rust-rpxy/pkgs/container/rust-rpxy).
+The images in these examples are published by upstream. [Docker Hub](https://hub.docker.com/r/jqtype/rpxy) · [GitHub Container Registry](https://github.com/junkurihara/rust-rpxy/pkgs/container/rust-rpxy)
 
 ## Usage
 

@@ -26,8 +26,10 @@ It is not backed by any commercial contract or SLA. Contributions are therefore 
 ### 3. Submitting code (Pull Requests)
 
 - Contributions are welcome! Please:
-  - Ensure code is formatted with `cargo fmt`.
-  - Run tests with `cargo test` and confirm they pass.
+  - Initialize the pinned dependencies with `git submodule update --init --recursive` and use the Rust version specified in [`Cargo.toml`](Cargo.toml).
+  - Format the Rust files you changed using the repository's `.rustfmt.toml`.
+  - Run `cargo test --workspace --locked`. The integration suite uses localhost TCP and UDP sockets.
+  - For changes to shared listener code, also run the TCP-only and s2n-quic test suites from the [Linux CI matrix](.github/workflows/ci.yml).
   - Keep commits clean and focused.
 - **Large behavioral or architectural changes should be discussed in an Issue or Discussion before a PR is submitted.**
 - **A large PR without prior design agreement may be closed even if the implementation itself is substantial.**
