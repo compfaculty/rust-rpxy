@@ -27,7 +27,6 @@ use hyper_util::{client::legacy::connect::Connect, rt::TokioIo, server::conn::au
 use rpxy_certs::ServerCrypto;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, time::timeout};
-use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "proxy-protocol")]
 use crate::globals::TcpRecvProxyProtocolConfig;
@@ -378,55 +377,6 @@ where
     Ok(())
   }
 
-  /// Start with TLS (HTTPS)
-  pub(super) async fn start_with_tls(&self, cancel_token: CancellationToken) -> RpxyResult<()> {
-    let join_handle_tls = self.globals.runtime_handle.spawn({
-      let self_clone = self.clone();
-      let cancel_token = cancel_token.clone();
-      async move {
-        select! {
-          _ = self_clone.tls_listener_service().fuse() => {
-            error!("TCP proxy service for TLS exited");
-            cancel_token.cancel();
-          },
-          _ = cancel_token.cancelled().fuse() => {
-            debug!("Cancel token is called for TLS listener");
-          }
-        }
-      }
-    });
-    let _ = join_handle_tls.await;
-    Ok(())
-  }
-
-  #[cfg(any(feature = "http3-quinn", feature = "http3-s2n"))]
-  /// Start with QUIC (HTTP/3)
-  pub(super) async fn start_with_quic(&self, cancel_token: CancellationToken) -> RpxyResult<()> {
-    debug_assert!(
-      self.listener_spec.is_http3(),
-      "start_with_quic should only be called for HTTP/3 listener"
-    );
-
-    // If HTTP/3 is enabled, spawn a task to handle HTTP/3 connections
-    let join_handle_h3 = self.globals.runtime_handle.spawn({
-      let self_clone = self.clone();
-      async move {
-        select! {
-          _ = self_clone.h3_listener_service().fuse() => {
-            error!("UDP proxy service for QUIC exited");
-            cancel_token.cancel();
-          },
-          _ = cancel_token.cancelled().fuse() => {
-            debug!("Cancel token is called for QUIC listener");
-          }
-        }
-      }
-    });
-    let _ = join_handle_h3.await;
-
-    Ok(())
-  }
-
   /// TCP Listener Service, i.e., http/2 and http/1.1
   async fn tls_listener_service(&self) -> RpxyResult<()> {
     let Some(mut server_crypto_rx) = self.globals.cert_reloader_rx.clone() else {
@@ -444,7 +394,8 @@ where
           self.serve_tls_tcp_connection(tcp_cnx, &server_crypto_map);
         }
         // Listen for certificate updates from the reloader, and update the in-memory server crypto map for TLS handshake accordingly
-        _ = server_crypto_rx.changed().fuse() => {
+        changed = server_crypto_rx.changed().fuse() => {
+          changed?;
           if server_crypto_rx.borrow().is_none() {
             error!("Reloader is broken");
             break;
@@ -566,27 +517,17 @@ where
   }
 
   /// Entrypoint for HTTP/1.1, 2 and 3 servers
-  pub async fn start(&self, cancel_token: CancellationToken) -> RpxyResult<()> {
+  pub async fn start(&self) -> RpxyResult<()> {
     #[cfg(any(feature = "http3-quinn", feature = "http3-s2n"))]
-    let proxy_service = async {
-      if self.listener_spec.is_http3() {
-        self.start_with_quic(cancel_token).await
-      } else if self.listener_spec.tls_enabled() {
-        self.start_with_tls(cancel_token).await
-      } else {
-        self.start_without_tls().await
-      }
-    };
-    #[cfg(not(any(feature = "http3-quinn", feature = "http3-s2n")))]
-    let proxy_service = async {
-      if self.listener_spec.tls_enabled() {
-        self.start_with_tls(cancel_token).await
-      } else {
-        self.start_without_tls().await
-      }
-    };
+    if self.listener_spec.is_http3() {
+      return self.h3_listener_service().await;
+    }
 
-    proxy_service.await
+    if self.listener_spec.tls_enabled() {
+      self.tls_listener_service().await
+    } else {
+      self.start_without_tls().await
+    }
   }
 }
 

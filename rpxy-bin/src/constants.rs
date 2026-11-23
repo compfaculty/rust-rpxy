@@ -2,7 +2,7 @@
 pub const DEFAULT_LISTEN_ADDRESS_V4: &str = "0.0.0.0";
 /// Default IPv6 listen addresses for the server.
 pub const DEFAULT_LISTEN_ADDRESS_V6: &str = "::";
-/// Delay in seconds before reloading the configuration after changes.
+/// Interval in seconds for rechecking configuration alongside filesystem notifications.
 pub const CONFIG_WATCH_DELAY_SECS: u32 = 15;
 
 #[cfg(feature = "cache")]

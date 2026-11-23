@@ -117,7 +117,8 @@ where
             Ok(())
           });
         }
-        _ = server_crypto_rx.changed() => {
+        changed = server_crypto_rx.changed() => {
+          changed?;
           let Some(cert_keys_map) = server_crypto_rx.get() else {
             error!("Reloader is broken");
             break;

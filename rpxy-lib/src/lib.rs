@@ -279,7 +279,7 @@ pub async fn entrypoint(
             debug!("rpxy proxy service for {} terminated", proxy.listener_spec);
             Ok(())
           },
-          proxy_res = proxy.start(cancel_token.child_token()) => {
+          proxy_res = proxy.start() => {
             info!("rpxy proxy service for {} exited", proxy.listener_spec);
             // cancel other proxy tasks
             cancel_token.cancel();

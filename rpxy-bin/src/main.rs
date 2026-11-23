@@ -31,11 +31,12 @@ use crate::{
   error::*,
   log::*,
 };
-use hot_reload::{ReloaderConfig, ReloaderReceiver, ReloaderService};
+use hot_reload::{AsyncFileLoad, ReloaderConfig, ReloaderReceiver, ReloaderService};
 #[cfg(feature = "sticky-cookie")]
 use rpxy_lib::StickyCookieSecret;
 use rpxy_lib::{RpxyOptions, RpxyOptionsBuilder, entrypoint};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tokio_util::sync::CancellationToken;
 
 fn main() {
@@ -67,12 +68,24 @@ fn main() {
     // be emitted. Not hot-reloaded, like the logger itself.
     let access_log_enabled = access_log_enabled(parsed_opts.log_dir_path.as_deref());
 
+    let config_path = &parsed_opts.config_file_path;
+    let initial_config = match ConfigToml::async_load_from(config_path).await {
+      Ok(config) => config,
+      Err(e) => {
+        error!("Cannot load configuration from {config_path}: {e}");
+        return 1;
+      }
+    };
     let reloader_config = ReloaderConfig::hybrid(CONFIG_WATCH_DELAY_SECS);
 
     let (config_service, config_rx) =
-      ReloaderService::<ConfigTomlReloader, ConfigToml, String>::new(&parsed_opts.config_file_path, reloader_config)
-        .await
-        .unwrap();
+      match ReloaderService::<ConfigTomlReloader, ConfigToml, String>::new(config_path, reloader_config).await {
+        Ok(reloader) => reloader,
+        Err(e) => {
+          error!("Cannot watch configuration at {config_path}: {e}");
+          return 1;
+        }
+      };
 
     // When profiling, allow Ctrl-C to return gracefully so the dhat profiler is
     // dropped and `dhat-heap.json` is flushed. In normal builds this future never
@@ -95,7 +108,7 @@ fn main() {
           return 1;
         }
       }
-      rpxy_res = rpxy_service(config_rx, runtime.handle().clone(), unsafe_debug_headers, access_log_enabled) => {
+      rpxy_res = rpxy_service(config_path, initial_config, config_rx, runtime.handle().clone(), unsafe_debug_headers, access_log_enabled) => {
         if let Err(e) = rpxy_res {
           error!("rpxy service exited: {e}");
           return 1;
@@ -303,12 +316,17 @@ impl RpxyService {
       let select_all = futures_util::future::select_all(acme_task_handles);
       let cancel_token_clone = cancel_token.clone();
       let acme_handle = runtime_handle.spawn(async move {
-        let (acme_res, _, _) = select_all.await;
+        let (acme_res, _, remaining) = select_all.await;
+        cancel_token_clone.cancel();
+        let remaining_results = futures_util::future::join_all(remaining).await;
         if let Err(ref e) = acme_res {
           error!("acme manager exited on error: {e}");
         }
-        cancel_token_clone.cancel();
-        acme_res.map_err(|e| anyhow!(e))
+        acme_res?;
+        for result in remaining_results {
+          result?;
+        }
+        Ok::<(), anyhow::Error>(())
       });
       let (rpxy_res, cert_res, acme_res) = tokio::join!(rpxy_handle, cert_handle, acme_handle);
       let (rpxy_res, cert_res, acme_res) = (rpxy_res?, cert_res?, acme_res?);
@@ -323,53 +341,76 @@ impl RpxyService {
 }
 
 async fn rpxy_service(
+  config_path: &str,
+  mut active_config: ConfigToml,
   mut config_rx: ReloaderReceiver<ConfigToml, String>,
   runtime_handle: tokio::runtime::Handle,
   unsafe_debug_headers: bool,
   access_log_enabled: bool,
 ) -> Result<(), anyhow::Error> {
   info!("Start rpxy service with dynamic config reloader");
-  // Initial loading
-  config_rx.changed().await?;
-  let config_toml = config_rx
-    .borrow()
-    .clone()
-    .ok_or(anyhow!("Something wrong in config reloader receiver"))?;
-  let mut service = RpxyService::new(&config_toml, runtime_handle.clone(), unsafe_debug_headers, access_log_enabled).await?;
+  let mut service = RpxyService::new(
+    &active_config,
+    runtime_handle.clone(),
+    unsafe_debug_headers,
+    access_log_enabled,
+  )
+  .await?;
+  let interval = Duration::from_secs(CONFIG_WATCH_DELAY_SECS.into());
+  let mut recheck = interval_at(Instant::now() + interval, interval);
+  recheck.set_missed_tick_behavior(MissedTickBehavior::Skip);
+  let mut last_input = None;
 
-  // Continuous monitoring
   loop {
-    // Notifier for proxy service termination
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-
-    tokio::select! {
-      /* ---------- */
-      rpxy_res = service.start(cancel_token.clone()) => {
-        if let Err(ref e) = rpxy_res {
-          error!("rpxy service exited on error: {e}");
-        } else {
-          error!("rpxy service exited");
-        }
-        return rpxy_res.map_err(|e| anyhow!(e));
-      }
-      /* ---------- */
-      _ = config_rx.changed() => {
-        let Some(new_config_toml) = config_rx.get() else {
-          error!("Something wrong in config reloader receiver");
-          return Err(anyhow!("Something wrong in config reloader receiver"));
-        };
-        match RpxyService::new(&new_config_toml, runtime_handle.clone(), unsafe_debug_headers, access_log_enabled).await {
-          Ok(new_service) => {
-            info!("Configuration updated.");
-            service = new_service;
-          },
-          Err(e) => {
-            error!("rpxy failed to be ready. Configuration does not updated: {e}");
+    let cancel_token = CancellationToken::new();
+    let (next_config, next_service) = {
+      let running = service.start(cancel_token.clone());
+      tokio::pin!(running);
+      let replacement = async {
+        loop {
+          // Read the current file after either trigger. A queued watcher value may
+          // predate a periodic read, and filesystem notifications can be missed.
+          tokio::select! {
+            changed = config_rx.changed() => changed?,
+            _ = recheck.tick() => {}
           }
-        };
-        info!("Terminate all spawned services and force to re-bind TCP/UDP sockets");
-        cancel_token.cancel();
-      }
-    }
+          let Ok(input) = tokio::fs::read_to_string(config_path).await else {
+            if last_input.take().is_some() {
+              warn!("Configuration file unavailable, keeping the active configuration");
+            }
+            continue;
+          };
+          if last_input.as_ref() == Some(&input) {
+            continue;
+          }
+          let config = ConfigToml::parse(&input);
+          last_input = Some(input);
+          let Ok(config) = config else {
+            warn!("Configuration file contains invalid TOML, keeping the active configuration");
+            continue;
+          };
+          // The watcher initially publishes the startup file, and may publish it again
+          // after an unrelated edit or after the file is restored.
+          if config == active_config {
+            continue;
+          }
+          match RpxyService::new(&config, runtime_handle.clone(), unsafe_debug_headers, access_log_enabled).await {
+            Ok(service) => return Ok::<_, anyhow::Error>((config, service)),
+            Err(e) => error!("Configuration update rejected, keeping the active configuration: {e}"),
+          }
+        }
+      };
+      let next = tokio::select! {
+        biased;
+        result = &mut running => return result,
+        result = replacement => result,
+      };
+      cancel_token.cancel();
+      running.await?;
+      next?
+    };
+    info!("Configuration updated. Rebinding TCP/UDP listeners");
+    active_config = next_config;
+    service = next_service;
   }
 }

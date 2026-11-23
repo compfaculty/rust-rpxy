@@ -56,7 +56,7 @@ where
 
     // initially wait for receipt
     let mut server_crypto: Option<s2n_quic_rustls::Server> = {
-      let _ = server_crypto_rx.changed().await;
+      server_crypto_rx.changed().await?;
       let sc = self.receive_server_crypto(server_crypto_rx.clone())?;
       Some(sc)
     };
@@ -64,26 +64,13 @@ where
     // event loop
     loop {
       tokio::select! {
-        v = self.h3_listener_service_inner(&server_crypto) => {
-          if let Err(e) = v {
-            error!("Quic connection event loop illegally shutdown [s2n-quic] {e}");
-            break;
-          }
+        result = self.h3_listener_service_inner(&server_crypto) => return result,
+        changed = server_crypto_rx.changed() => {
+          changed?;
+          server_crypto = Some(self.receive_server_crypto(server_crypto_rx.clone())?);
         }
-        _ = server_crypto_rx.changed() => {
-          server_crypto = match self.receive_server_crypto(server_crypto_rx.clone()) {
-            Ok(sc) => Some(sc),
-            Err(e) => {
-              error!("{e}");
-              break;
-            }
-          };
-        }
-        else => break
       }
     }
-
-    Ok(())
   }
 
   /// Receive server crypto from reloader
