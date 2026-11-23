@@ -1,4 +1,8 @@
-use crate::{certs::SingleServerCertsKeys, error::*, log::*};
+use crate::{
+  certs::{SingleServerCertsKeys, client_ca_trust_anchors},
+  error::*,
+  log::*,
+};
 use async_trait::async_trait;
 use derive_builder::Builder;
 use rustls::pki_types::{self, pem::PemObject};
@@ -54,6 +58,27 @@ impl CryptoFileSourceBuilder {
   }
 }
 
+impl CryptoFileSource {
+  /// Check local TLS files for a configured server name without starting a reloader.
+  pub fn validate(&self, server_name: &str) -> Result<(), RpxyCertError> {
+    read_certs_and_keys(
+      &self.tls_cert_path,
+      &self.tls_cert_key_path,
+      self.client_ca_cert_path.as_deref(),
+    )?
+    .validate_for_server_name(server_name)
+  }
+
+  /// Check the client trust anchors independently of the server certificate.
+  pub fn validate_client_ca(path: &Path) -> Result<(), RpxyCertError> {
+    let certs = read_client_ca_certs(path)?;
+    if client_ca_trust_anchors(&certs).is_empty() {
+      return Err(RpxyCertError::NoUsableClientCaCertificates);
+    }
+    Ok(())
+  }
+}
+
 /* ------------------------------------------------ */
 #[async_trait]
 impl CryptoSource for CryptoFileSource {
@@ -63,7 +88,7 @@ impl CryptoSource for CryptoFileSource {
     read_certs_and_keys(
       &self.tls_cert_path,
       &self.tls_cert_key_path,
-      self.client_ca_cert_path.as_ref(),
+      self.client_ca_cert_path.as_deref(),
     )
   }
   /// Returns true when mutual tls is enabled
@@ -112,7 +137,7 @@ fn warn_if_key_perm_loose(path: &Path) {
 fn read_certs_and_keys(
   cert_path: &PathBuf,
   cert_key_path: &PathBuf,
-  client_ca_cert_path: Option<&PathBuf>,
+  client_ca_cert_path: Option<&Path>,
 ) -> Result<SingleServerCertsKeys, RpxyCertError> {
   trace!("Read TLS server certificates and private key");
 
@@ -171,28 +196,27 @@ fn read_certs_and_keys(
 
   // ------------------------
   // client ca certificates
-  let client_ca_certs = client_ca_cert_path
-    .map(|path| {
-      trace!("Read CA certificates for client authentication");
-      // Reads client certificate and returns client
-      let inner = File::open(path).map_err(|e| {
-        io::Error::new(
-          e.kind(),
-          format!("Unable to load the client certificates [{}]: {e}", path.display()),
-        )
-      })?;
-      let mut reader = BufReader::new(inner);
-      pki_types::CertificateDer::pem_reader_iter(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Unable to parse the client certificates"))
-    })
-    .transpose()?;
+  let client_ca_certs = client_ca_cert_path.map(read_client_ca_certs).transpose()?;
 
   Ok(SingleServerCertsKeys::new(
     &raw_certs,
     &Arc::new(raw_cert_keys),
     &client_ca_certs,
   ))
+}
+
+fn read_client_ca_certs(path: &Path) -> Result<Vec<pki_types::CertificateDer<'static>>, io::Error> {
+  trace!("Read CA certificates for client authentication");
+  let file = File::open(path).map_err(|e| {
+    io::Error::new(
+      e.kind(),
+      format!("Unable to load the client certificates [{}]: {e}", path.display()),
+    )
+  })?;
+  let mut reader = BufReader::new(file);
+  pki_types::CertificateDer::pem_reader_iter(&mut reader)
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Unable to parse the client certificates"))
 }
 
 #[cfg(all(test, unix))]

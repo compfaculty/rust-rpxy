@@ -700,13 +700,12 @@ impl ConfigToml {
     Ok(config)
   }
 
-  fn deserialize_with_unsupported_fields(config_str: &str) -> std::result::Result<(Self, Vec<String>), anyhow::Error> {
+  pub(super) fn deserialize_with_unsupported_fields(config_str: &str) -> Result<(Self, Vec<String>), toml::de::Error> {
     let deserializer = toml::Deserializer::parse(config_str)?;
     let mut unsupported_fields = Vec::new();
     let config = serde_ignored::deserialize(deserializer, |path| {
       unsupported_fields.push(Self::normalize_unsupported_path(&path.to_string()));
-    })
-    .map_err(|e| anyhow!(e))?;
+    })?;
 
     unsupported_fields.sort_unstable();
     unsupported_fields.dedup();

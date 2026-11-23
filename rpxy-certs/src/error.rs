@@ -9,6 +9,16 @@ pub enum RpxyCertError {
   /// Error when parsing certificates and keys to generate a rustls CertifiedKey
   #[error("Unable to find a valid certificate and key")]
   InvalidCertificateAndKey,
+  #[error("Cannot match the server certificate to its private key")]
+  InvalidServerCertificateKey(#[source] rustls::Error),
+  #[error("Cannot use the server certificate for the configured hostname")]
+  InvalidServerCertificateName(#[source] rustls::Error),
+  #[error("Server certificate {position} is not valid X.509")]
+  InvalidServerCertificate { position: usize },
+  #[error("Server certificate {position} is expired or not yet valid")]
+  InvalidServerCertificateValidity { position: usize },
+  #[error("Client CA file contains no usable trust anchors with a subject key identifier")]
+  NoUsableClientCaCertificates,
   /// Error when parsing client CA certificates: No client certificate found
   #[error("No client certificate found")]
   NoClientCert,

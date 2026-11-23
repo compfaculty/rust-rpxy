@@ -1,9 +1,11 @@
 use super::toml::{ConfigToml, ConfigTomlExt};
-use crate::error::{anyhow, ensure};
+use crate::error::anyhow;
+#[cfg(feature = "acme")]
+use crate::error::ensure;
 use ahash::HashMap;
-use clap::Arg;
+use clap::{Arg, ArgAction};
 use hot_reload::{ReloaderReceiver, ReloaderService};
-use rpxy_certs::{CryptoFileSourceBuilder, CryptoReloader, ServerCryptoBase, build_cert_reloader};
+use rpxy_certs::{CryptoFileSource, CryptoFileSourceBuilder, CryptoReloader, ServerCryptoBase, build_cert_reloader};
 #[cfg(feature = "sticky-cookie")]
 use rpxy_lib::StickyCookieSecret;
 use rpxy_lib::{AppConfigList, ProxyConfig};
@@ -15,22 +17,15 @@ use super::toml::validate_server_name;
 #[cfg(feature = "acme")]
 use rpxy_acme::{ACME_DIR_URL, ACME_REGISTRY_PATH, AcmeManager};
 
-/// Parsed options from CLI
 /// Options for configuring the application.
-///
-/// # Fields
-/// - `config_file_path`: Path to the configuration file.
-/// - `log_dir_path`: Optional path to the log directory.
 pub struct Opts {
   pub config_file_path: String,
   pub log_dir_path: Option<String>,
+  pub check_config: bool,
 }
 
-/// Parses command-line arguments into an [`Opts`](rpxy-bin/src/config/parse.rs:13) struct.
-///
-/// Returns a populated [`Opts`](rpxy-bin/src/config/parse.rs:13) on success, or an error if parsing fails.
-/// Expects a required `--config` argument and an optional `--log-dir` argument.
-pub fn parse_opts() -> Result<Opts, anyhow::Error> {
+/// Parse command-line arguments and let clap report invalid usage.
+pub fn parse_opts() -> Opts {
   let _ = include_str!("../../Cargo.toml");
   let options = clap::command!()
     .arg(
@@ -47,16 +42,24 @@ pub fn parse_opts() -> Result<Opts, anyhow::Error> {
         .short('l')
         .value_name("LOG_DIR")
         .help("Directory for log files. If not specified, logs are printed to stdout."),
+    )
+    .arg(
+      Arg::new("check_config")
+        .long("check-config")
+        .action(ArgAction::SetTrue)
+        .conflicts_with("log_dir")
+        .help("Validate configuration and local TLS files, then exit."),
     );
   let matches = options.get_matches();
 
   let config_file_path = matches.get_one::<String>("config_file").unwrap().to_owned();
   let log_dir_path = matches.get_one::<String>("log_dir").map(|v| v.to_owned());
 
-  Ok(Opts {
+  Opts {
     config_file_path,
     log_dir_path,
-  })
+    check_config: matches.get_flag("check_config"),
+  }
 }
 
 /// Build proxy and app settings from config using ConfigTomlExt
@@ -67,6 +70,21 @@ pub fn build_settings(config: &ConfigToml) -> Result<(ProxyConfig, AppConfigList
 #[cfg(feature = "sticky-cookie")]
 pub fn build_sticky_cookie_secret(config: &ConfigToml) -> Result<Option<Arc<StickyCookieSecret>>, anyhow::Error> {
   config.validate_and_build_sticky_cookie_secret()
+}
+
+pub(super) fn tls_file_source(tls: &super::toml::TlsOption) -> Result<CryptoFileSource, anyhow::Error> {
+  let cert_path = tls.tls_cert_path.as_deref().ok_or_else(|| anyhow!("Missing tls_cert_path"))?;
+  let key_path = tls
+    .tls_cert_key_path
+    .as_deref()
+    .ok_or_else(|| anyhow!("Missing tls_cert_key_path"))?;
+  Ok(
+    CryptoFileSourceBuilder::default()
+      .tls_cert_path(cert_path)
+      .tls_cert_key_path(key_path)
+      .client_ca_cert_path(tls.client_ca_cert_path.as_deref())
+      .build()?,
+  )
 }
 
 /* ----------------------- */
@@ -135,19 +153,14 @@ pub async fn build_cert_manager(
     if let Some(tls) = app.tls.as_ref() {
       let server_name = app.server_name.as_ref().ok_or(anyhow!("No server name"))?;
 
-      #[cfg(not(feature = "acme"))]
-      ensure!(tls.tls_cert_key_path.is_some() && tls.tls_cert_path.is_some());
-
       #[cfg(feature = "acme")]
       let mut tls = tls.clone();
       #[cfg(feature = "acme")]
       build_tls_for_app_acme(&mut tls, &acme_option, server_name, acme_registry_path, acme_dir_url)?;
 
-      let crypto_file_source = CryptoFileSourceBuilder::default()
-        .tls_cert_path(tls.tls_cert_path.as_ref().unwrap())
-        .tls_cert_key_path(tls.tls_cert_key_path.as_ref().unwrap())
-        .client_ca_cert_path(tls.client_ca_cert_path.as_deref())
-        .build()?;
+      #[cfg(feature = "acme")]
+      let tls = &tls;
+      let crypto_file_source = tls_file_source(tls)?;
       crypto_source_map.insert(server_name.to_owned(), crypto_file_source);
     }
   }

@@ -9,6 +9,8 @@ pub enum RpxyAcmeError {
   /// Invalid url
   #[error("Invalid url: {0}")]
   InvalidUrl(#[from] url::ParseError),
+  #[error("ACME directory URL must use HTTP or HTTPS and include a host")]
+  InvalidDirectoryUrl,
   /// IO error
   #[error("IO error: {0}")]
   Io(#[from] std::io::Error),

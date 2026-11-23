@@ -4,11 +4,86 @@ use crate::{
   log::*,
   name_exp::{ByteName, ServerName},
 };
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
+use anyhow::{Context, ensure};
 use derive_builder::Builder;
+use http::uri::PathAndQuery;
 use std::borrow::Cow;
 
-use super::upstream::PathManager;
+use super::{UpstreamOption, load_balance::load_balance_options, upstream::PathManager};
+
+impl AppConfigList {
+  /// Check that configured routes can be built and that every entry takes effect.
+  /// This is used by the CLI's strict configuration check before starting services.
+  pub fn validate_routes(&self) -> anyhow::Result<()> {
+    let mut app_names = HashSet::default();
+    let mut server_names = HashSet::default();
+    for app in &self.inner {
+      ensure!(
+        app_names.insert(app.app_name.to_ascii_lowercase()),
+        "Duplicate app name {:?}",
+        app.app_name
+      );
+      ensure!(
+        server_names.insert(app.server_name.as_str().to_server_name()),
+        "Duplicate server_name {:?}",
+        app.server_name
+      );
+      ensure!(
+        !app.reverse_proxy.is_empty(),
+        "App {:?} has no reverse_proxy routes",
+        app.app_name
+      );
+      let mut paths = HashSet::default();
+      for (index, route) in app.reverse_proxy.iter().enumerate() {
+        let path = route.path.as_deref().unwrap_or("/");
+        let entry = format!("apps.{}.reverse_proxy[{index}]", app.app_name);
+        ensure!(paths.insert(path), "{entry}: duplicate path {path:?}");
+        for (field, value) in [("path", Some(path)), ("replace_path", route.replace_path.as_deref())] {
+          if let Some(value) = value {
+            ensure!(
+              value.starts_with('/')
+                && value
+                  .parse::<PathAndQuery>()
+                  .is_ok_and(|path| path.query().is_none() && path.as_str() == value),
+              "{entry}.{field} must be an absolute URL path without a query or fragment"
+            );
+          }
+        }
+        if let Some(mode) = route.load_balance.as_deref() {
+          match mode {
+            load_balance_options::FIX_TO_FIRST | load_balance_options::RANDOM | load_balance_options::ROUND_ROBIN => {}
+            #[cfg(feature = "sticky-cookie")]
+            load_balance_options::STICKY_ROUND_ROBIN => {}
+            #[cfg(feature = "health-check")]
+            load_balance_options::PRIMARY_BACKUP => {}
+            _ => anyhow::bail!("{entry}.load_balance {mode:?} is unknown or unavailable in this build"),
+          }
+        }
+        for option in route.upstream_options.iter().flatten() {
+          UpstreamOption::try_from(option.as_str())
+            .with_context(|| format!("{entry}.upstream_options contains unknown option {option:?}"))?;
+        }
+        #[cfg(not(any(feature = "rustls-backend", feature = "native-tls-backend")))]
+        ensure!(
+          route
+            .upstream
+            .iter()
+            .all(|upstream| upstream.inner.scheme_str() != Some("https")),
+          "{entry} requires HTTPS upstream support (rustls-backend or native-tls-backend)"
+        );
+      }
+      PathManager::try_from(app).with_context(|| format!("Invalid routes for app {:?}", app.app_name))?;
+    }
+    if let Some(default_app) = &self.default_app {
+      ensure!(
+        app_names.contains(&default_app.to_ascii_lowercase()),
+        "default_app {default_app:?} does not name a configured app"
+      );
+    }
+    Ok(())
+  }
+}
 
 /// Struct serving information to route incoming connections, like server name to be handled and tls certs/keys settings.
 #[derive(Builder)]

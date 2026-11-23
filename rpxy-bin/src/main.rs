@@ -26,7 +26,7 @@ use crate::config::build_acme_manager;
 #[cfg(feature = "sticky-cookie")]
 use crate::config::build_sticky_cookie_secret;
 use crate::{
-  config::{ConfigToml, ConfigTomlReloader, build_cert_manager, build_settings, parse_opts},
+  config::{ConfigToml, ConfigTomlReloader, build_cert_manager, build_settings, check_config, parse_opts},
   constants::CONFIG_WATCH_DELAY_SECS,
   error::*,
   log::*,
@@ -40,6 +40,20 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tokio_util::sync::CancellationToken;
 
 fn main() {
+  let parsed_opts = parse_opts();
+  if parsed_opts.check_config {
+    init_logger(None);
+    let path = std::path::Path::new(&parsed_opts.config_file_path);
+    match check_config(path) {
+      Ok(()) => println!("Configuration is valid."),
+      Err(error) => {
+        eprintln!("Configuration check failed for {}: {error:#}", path.display());
+        std::process::exit(1);
+      }
+    }
+    return;
+  }
+
   // Keep the heap profiler alive for the whole process. On drop it writes
   // `dhat-heap.json`; because `std::process::exit` skips destructors, the exit
   // call below is moved out of the async block and the profiler is dropped first.
@@ -52,11 +66,6 @@ fn main() {
   let runtime = runtime_builder.build().unwrap();
 
   let exit_code: i32 = runtime.block_on(async {
-    // Initially load options
-    let Ok(parsed_opts) = parse_opts() else {
-      return 1;
-    };
-
     init_logger(parsed_opts.log_dir_path.as_deref());
 
     // Read the unsafe debug-header logging opt-out once at startup.

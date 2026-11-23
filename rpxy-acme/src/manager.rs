@@ -29,6 +29,28 @@ pub struct AcmeManager {
 }
 
 impl AcmeManager {
+  /// Validate local ACME settings without creating the registry or contacting the directory.
+  pub fn check_config(acme_dir_url: Option<&str>, acme_registry_dir: Option<&str>) -> Result<(), RpxyAcmeError> {
+    Self::resolve_configuration(acme_dir_url, acme_registry_dir).map(|_| ())
+  }
+
+  fn resolve_configuration(acme_dir_url: Option<&str>, acme_registry_dir: Option<&str>) -> Result<(Url, PathBuf), RpxyAcmeError> {
+    let registry = acme_registry_dir
+      .map(|v| v.to_ascii_lowercase())
+      .map_or_else(|| PathBuf::from(ACME_REGISTRY_PATH), PathBuf::from);
+    if registry.exists() && !registry.is_dir() {
+      return Err(RpxyAcmeError::InvalidAcmeRegistryPath);
+    }
+    let url = acme_dir_url
+      .map(|v| v.to_ascii_lowercase())
+      .as_deref()
+      .map_or_else(|| Url::parse(ACME_DIR_URL), Url::parse)?;
+    if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
+      return Err(RpxyAcmeError::InvalidDirectoryUrl);
+    }
+    Ok((url, registry))
+  }
+
   /// Create a new instance. Note that for each domain, a new AcmeConfig is created.
   /// This means that for each domain, a distinct operation will be dispatched and separated certificates will be generated.
   pub async fn try_new(
@@ -41,16 +63,7 @@ impl AcmeManager {
     // Install aws_lc_rs as default crypto provider for rustls
     let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
 
-    let acme_registry_dir = acme_registry_dir
-      .map(|v| v.to_ascii_lowercase())
-      .map_or_else(|| PathBuf::from(ACME_REGISTRY_PATH), PathBuf::from);
-    if acme_registry_dir.exists() && !acme_registry_dir.is_dir() {
-      return Err(RpxyAcmeError::InvalidAcmeRegistryPath);
-    }
-    let acme_dir_url = acme_dir_url
-      .map(|v| v.to_ascii_lowercase())
-      .as_deref()
-      .map_or_else(|| Url::parse(ACME_DIR_URL), Url::parse)?;
+    let (acme_dir_url, acme_registry_dir) = Self::resolve_configuration(acme_dir_url, acme_registry_dir)?;
     let contacts = contacts.iter().map(|email| format!("mailto:{email}")).collect::<Vec<_>>();
 
     let inner = domains
@@ -167,12 +180,19 @@ mod tests {
   #[tokio::test]
   async fn test_try_new() {
     let acme_dir_url = "https://acme.example.com/directory";
-    let acme_registry_dir = "/tmp/acme";
+    // ACME currently lowercases the whole path, including the default temp directory's name.
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let registry = tempfile::Builder::new()
+      .prefix(&format!("rpxy-acme-{}-{:x}", std::process::id(), nonce.as_nanos()))
+      .rand_bytes(0)
+      .tempdir_in("/tmp")
+      .unwrap();
+    let acme_registry_dir = registry.path();
     let contacts = vec!["test@example.com".to_string()];
     let handle = Handle::current();
     let acme_contexts: AcmeManager = AcmeManager::try_new(
       Some(acme_dir_url),
-      Some(acme_registry_dir),
+      Some(acme_registry_dir.to_str().unwrap()),
       &contacts,
       &["example.com".to_string(), "example.org".to_string()],
       handle,
@@ -182,19 +202,18 @@ mod tests {
     assert_eq!(acme_contexts.inner.len(), 2);
     assert_eq!(acme_contexts.contacts, vec!["mailto:test@example.com".to_string()]);
     assert_eq!(acme_contexts.acme_dir_url.as_str(), acme_dir_url);
-    // assert_eq!(acme_contexts.acme_registry_dir, PathBuf::from(acme_registry_dir));
     assert_eq!(
       acme_contexts.inner["example.com"],
       DirCache {
-        account_dir: PathBuf::from(acme_registry_dir).join(ACME_ACCOUNT_SUBDIR),
-        cert_dir: PathBuf::from(acme_registry_dir).join("example.com"),
+        account_dir: acme_registry_dir.join(ACME_ACCOUNT_SUBDIR),
+        cert_dir: acme_registry_dir.join("example.com"),
       }
     );
     assert_eq!(
       acme_contexts.inner["example.org"],
       DirCache {
-        account_dir: PathBuf::from(acme_registry_dir).join(ACME_ACCOUNT_SUBDIR),
-        cert_dir: PathBuf::from(acme_registry_dir).join("example.org"),
+        account_dir: acme_registry_dir.join(ACME_ACCOUNT_SUBDIR),
+        cert_dir: acme_registry_dir.join("example.org"),
       }
     );
   }

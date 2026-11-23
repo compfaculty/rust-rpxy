@@ -1,6 +1,6 @@
 use crate::error::*;
 use ahash::HashMap;
-use rustls::{crypto::aws_lc_rs::sign::any_supported_type, pki_types, sign::CertifiedKey};
+use rustls::{crypto::aws_lc_rs::sign::any_supported_type, pki_types, server::ResolvesServerCertUsingSni, sign::CertifiedKey};
 use std::sync::Arc;
 use x509_parser::prelude::*;
 
@@ -72,32 +72,55 @@ impl SingleServerCertsKeys {
     Ok(CertifiedKey::new(cert, signing_key))
   }
 
+  pub(crate) fn validate_for_server_name(&self, server_name: &str) -> Result<(), RpxyCertError> {
+    let key = self.rustls_certified_key()?;
+    key.keys_match().map_err(RpxyCertError::InvalidServerCertificateKey)?;
+    for (index, certificate) in key.cert.iter().enumerate() {
+      let position = index + 1;
+      let (remaining, certificate) =
+        parse_x509_certificate(certificate).map_err(|_| RpxyCertError::InvalidServerCertificate { position })?;
+      if !remaining.is_empty() {
+        return Err(RpxyCertError::InvalidServerCertificate { position });
+      }
+      if !certificate.validity().is_valid() {
+        return Err(RpxyCertError::InvalidServerCertificateValidity { position });
+      }
+    }
+    ResolvesServerCertUsingSni::new()
+      .add(server_name, key)
+      .map_err(RpxyCertError::InvalidServerCertificateName)?;
+    if self.is_mutual_tls() && self.rustls_client_certs_trust_anchors()?.is_empty() {
+      return Err(RpxyCertError::NoUsableClientCaCertificates);
+    }
+    Ok(())
+  }
+
   /* ------------------------------------------------ */
   /// Parse the client CA certificates and return a hashmap of pairs of a subject key identifier (key) and a trust anchor (value)
   pub fn rustls_client_certs_trust_anchors(&self) -> Result<TrustAnchors, RpxyCertError> {
     let certs = self.client_ca_certs.as_ref().ok_or(RpxyCertError::NoClientCert)?;
-    let certs = certs.iter().map(|c| Certificate::from(c.to_vec())).collect::<Vec<_>>();
-
-    let trust_anchors = certs
-      .iter()
-      .filter_map(|v| {
-        // retrieve trust anchor
-        let trust_anchor = webpki::anchor_from_trusted_cert(v).ok()?;
-
-        // retrieve ca key id (subject key id)
-        let x509_cert = parse_x509_certificate(v).map(|v| v.1).ok()?;
-        let mut subject_key_ids = x509_cert.iter_extensions().filter_map(|ext| match ext.parsed_extension() {
-          ParsedExtension::SubjectKeyIdentifier(skid) => Some(skid),
-          _ => None,
-        });
-        let skid = subject_key_ids.next()?;
-
-        Some((skid.0.to_owned(), trust_anchor.to_owned()))
-      })
-      .collect::<HashMap<_, _>>();
-
-    Ok(trust_anchors)
+    Ok(client_ca_trust_anchors(certs))
   }
+}
+
+pub(crate) fn client_ca_trust_anchors(certs: &[Certificate]) -> TrustAnchors {
+  certs
+    .iter()
+    .filter_map(|v| {
+      // retrieve trust anchor
+      let trust_anchor = webpki::anchor_from_trusted_cert(v).ok()?;
+
+      // retrieve ca key id (subject key id)
+      let x509_cert = parse_x509_certificate(v).map(|v| v.1).ok()?;
+      let mut subject_key_ids = x509_cert.iter_extensions().filter_map(|ext| match ext.parsed_extension() {
+        ParsedExtension::SubjectKeyIdentifier(skid) => Some(skid),
+        _ => None,
+      });
+      let skid = subject_key_ids.next()?;
+
+      Some((skid.0.to_owned(), trust_anchor.to_owned()))
+    })
+    .collect()
 }
 
 /* ------------------------------------------------ */
