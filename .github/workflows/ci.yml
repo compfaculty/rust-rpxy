@@ -1,4 +1,4 @@
-name: Unit Test
+name: Linux Tests
 
 on:
   push:
@@ -13,7 +13,18 @@ env:
 
 jobs:
   test:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Default (Quinn)
+            cargo_args: --workspace
+          - name: TCP only
+            cargo_args: -p rpxy -p rpxy-lib --no-default-features --features rpxy/rustls-backend
+          - name: s2n-quic
+            cargo_args: -p rpxy -p rpxy-lib --no-default-features --features rpxy/http3-s2n,rpxy/rustls-backend
 
     steps:
       - uses: actions/checkout@v7
@@ -26,6 +37,5 @@ jobs:
           rustup update stable --no-self-update
           rustup default stable
           rustc --version
-      - name: Run unit tests
-        run: |
-          cargo test --verbose
+      - name: Run unit and integration tests
+        run: cargo test --locked ${{ matrix.cargo_args }}
